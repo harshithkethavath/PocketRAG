@@ -20,6 +20,8 @@ from .retrieval import (
     EmbeddingModel,
     EmbeddingConfig,
 )
+from .eval import load_qrels_jsonl, evaluate_retrieval
+
 
 logger = get_logger(__name__)
 
@@ -224,6 +226,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="Batch size for query encoding (default: 32).",
     )
     p_dense_search.set_defaults(func=cmd_search_dense)
+
+
+    p_eval = subparsers.add_parser(
+        "eval-retrieval",
+        help="Evaluate retrieval quality (Recall@K, MRR) for BM25 or Dense.",
+    )
+    p_eval.add_argument(
+        "--qrels-file",
+        type=str,
+        required=True,
+        help="Path to JSONL file with qrels (queries + relevant_doc_ids).",
+    )
+    p_eval.add_argument(
+        "--mode",
+        type=str,
+        required=True,
+        choices=["bm25", "dense"],
+        help="Retrieval mode to evaluate: 'bm25' or 'dense'.",
+    )
+    p_eval.add_argument(
+        "--bm25-index",
+        type=str,
+        help="Path to BM25 index pickle file (required if mode=bm25).",
+    )
+    p_eval.add_argument(
+        "--dense-index",
+        type=str,
+        help="Path to dense index file (torch save, required if mode=dense).",
+    )
+    p_eval.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="Cutoff K for metrics (default: 10).",
+    )
+    p_eval.add_argument(
+        "--device-pref",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device preference for dense mode (default: auto).",
+    )
+    p_eval.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for dense encoding during evaluation (default: 32).",
+    )
+    p_eval.set_defaults(func=cmd_eval_retrieval)
 
     return parser
 
@@ -441,6 +492,80 @@ def cmd_search_dense(args: argparse.Namespace) -> None:
         )
         print(f"    {snippet}")
         print()
+
+
+def cmd_eval_retrieval(args: argparse.Namespace) -> None:
+    """
+    Evaluate retrieval quality for BM25 or Dense index using a qrels file.
+    """
+    qrels_path = Path(args.qrels_file).expanduser().resolve()
+    if not qrels_path.exists():
+        raise SystemExit(f"Qrels file does not exist: {qrels_path}")
+
+    logger.info(f"Loading qrels from {qrels_path} ...")
+    samples = load_qrels_jsonl(qrels_path)
+    logger.info(f"Loaded {len(samples)} evaluation queries.")
+
+    mode = args.mode.lower()
+    top_k = args.top_k
+
+    if mode == "bm25":
+        index_path = Path(args.bm25_index).expanduser().resolve()
+        if not index_path.exists():
+            raise SystemExit(f"BM25 index file does not exist: {index_path}")
+
+        logger.info(f"Loading BM25 index from {index_path} ...")
+        bm25_index = BM25Index.load(index_path)
+        logger.info(
+            f"BM25 index: N={bm25_index.N}, avgdl={bm25_index.avgdl:.2f}"
+        )
+
+        def retrieve_fn(query: str, k: int):
+            return bm25_index.score_query(query, top_k=k)
+
+    elif mode == "dense":
+        index_path = Path(args.dense_index).expanduser().resolve()
+        if not index_path.exists():
+            raise SystemExit(f"Dense index file does not exist: {index_path}")
+
+        logger.info(f"Loading dense index from {index_path} ...")
+        dense_index = DenseIndex.load(index_path)
+        logger.info(
+            f"Dense index: N={dense_index.embeddings.shape[0]}, "
+            f"D={dense_index.embeddings.shape[1]}, model={dense_index.model_name}"
+        )
+
+        encoder = EmbeddingModel(
+            EmbeddingConfig(
+                model_name=dense_index.model_name,
+                device_pref=args.device_pref,
+                batch_size=args.batch_size,
+            )
+        )
+
+        def retrieve_fn(query: str, k: int):
+            return dense_index.search(query=query, encoder=encoder, top_k=k)
+
+    else:
+        raise SystemExit(f"Unknown mode: {mode}. Expected 'bm25' or 'dense'.")
+
+    logger.info(
+        f"Evaluating retrieval: mode={mode}, top_k={top_k}, "
+        f"num_queries={len(samples)} ..."
+    )
+
+    metrics = evaluate_retrieval(samples, retrieve_fn, top_k=top_k)
+
+    print()
+    print("Retrieval Evaluation Results")
+    print("----------------------------")
+    print(f"Mode           : {mode}")
+    print(f"Num queries    : {metrics.num_queries}")
+    print(f"Top-K          : {metrics.top_k}")
+    print(f"Mean Recall@K  : {metrics.mean_recall:.4f}")
+    print(f"Mean HitRate@K : {metrics.mean_hit_rate:.4f}")
+    print(f"Mean MRR       : {metrics.mean_mrr:.4f}")
+    print()
 
 
 def main() -> None:
