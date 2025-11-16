@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
-from .schemas import Document
+from .schemas import Document, DocumentChunk
 
 
 def iter_text_files(
@@ -56,3 +57,31 @@ def load_documents_from_dir(
         )
 
     return documents
+
+def load_chunks_from_jsonl(path: Path | str) -> List[DocumentChunk]:
+    """
+    Load DocumentChunk objects from a JSONL file created by build-chunks.
+    """
+    p = Path(path).expanduser().resolve()
+    chunks: List[DocumentChunk] = []
+
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+
+            chunks.append(
+                DocumentChunk(
+                    chunk_id=obj["chunk_id"],
+                    doc_id=obj["doc_id"],
+                    position=int(obj["position"]),
+                    text=obj["text"],
+                    start_char=obj.get("start_char"),
+                    end_char=obj.get("end_char"),
+                    metadata=obj.get("metadata", {}),
+                )
+            )
+
+    return chunks
