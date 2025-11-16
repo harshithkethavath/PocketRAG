@@ -20,7 +20,17 @@ from .retrieval import (
     EmbeddingModel,
     EmbeddingConfig,
 )
-from .eval import load_qrels_jsonl, evaluate_retrieval
+from .generation import (
+    GenerationConfig,
+    LocalHFGenerator,
+)
+from .generation.rag_pipeline import RAGPipeline
+from .eval import (
+    load_qrels_jsonl,
+    evaluate_retrieval,
+    load_qa_jsonl,
+    evaluate_generation as eval_gen_fn,
+)
 
 
 logger = get_logger(__name__)
@@ -275,6 +285,157 @@ def build_parser() -> argparse.ArgumentParser:
         help="Batch size for dense encoding during evaluation (default: 32).",
     )
     p_eval.set_defaults(func=cmd_eval_retrieval)
+
+
+    p_rag = subparsers.add_parser(
+        "rag-answer",
+        help="Run a single RAG query (retrieve + generate).",
+    )
+    p_rag.add_argument(
+        "--mode",
+        type=str,
+        required=True,
+        choices=["bm25", "dense"],
+        help="Retrieval mode to use: 'bm25' or 'dense'.",
+    )
+    p_rag.add_argument(
+        "--bm25-index",
+        type=str,
+        help="Path to BM25 index (required if mode=bm25).",
+    )
+    p_rag.add_argument(
+        "--dense-index",
+        type=str,
+        help="Path to dense index (required if mode=dense).",
+    )
+    p_rag.add_argument(
+        "--query",
+        type=str,
+        required=True,
+        help="Question to ask.",
+    )
+    p_rag.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Number of chunks to retrieve as context (default: 5).",
+    )
+    p_rag.add_argument(
+        "--model-name",
+        type=str,
+        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        help="HF causal LM model name for generation.",
+    )
+    p_rag.add_argument(
+        "--device-pref",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device preference for generation (default: auto).",
+    )
+    p_rag.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=256,
+        help="Max new tokens for generation (default: 256).",
+    )
+    p_rag.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature (default: 0.7).",
+    )
+    p_rag.add_argument(
+        "--top-p",
+        type=float,
+        default=0.9,
+        help="Top-p nucleus sampling (default: 0.9).",
+    )
+    p_rag.add_argument(
+        "--max-context-chars",
+        type=int,
+        default=4000,
+        help="Max characters of concatenated context (default: 4000).",
+    )
+    p_rag.set_defaults(func=cmd_rag_answer)
+
+    p_eval_gen = subparsers.add_parser(
+        "eval-generation",
+        help="Evaluate RAG generation (EM/F1) on a QA set.",
+    )
+    p_eval_gen.add_argument(
+        "--qa-file",
+        type=str,
+        required=True,
+        help="Path to QA JSONL file (q_id, question, answers).",
+    )
+    p_eval_gen.add_argument(
+        "--mode",
+        type=str,
+        required=True,
+        choices=["bm25", "dense"],
+        help="Retrieval mode to use: 'bm25' or 'dense'.",
+    )
+    p_eval_gen.add_argument(
+        "--bm25-index",
+        type=str,
+        help="Path to BM25 index (required if mode=bm25).",
+    )
+    p_eval_gen.add_argument(
+        "--dense-index",
+        type=str,
+        help="Path to dense index (required if mode=dense).",
+    )
+    p_eval_gen.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Number of chunks to retrieve as context (default: 5).",
+    )
+    p_eval_gen.add_argument(
+        "--model-name",
+        type=str,
+        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        help="HF causal LM model name for generation.",
+    )
+    p_eval_gen.add_argument(
+        "--device-pref",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device preference for generation (default: auto).",
+    )
+    p_eval_gen.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=256,
+        help="Max new tokens for generation (default: 256).",
+    )
+    p_eval_gen.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature (default: 0.7).",
+    )
+    p_eval_gen.add_argument(
+        "--top-p",
+        type=float,
+        default=0.9,
+        help="Top-p nucleus sampling (default: 0.9).",
+    )
+    p_eval_gen.add_argument(
+        "--max-context-chars",
+        type=int,
+        default=4000,
+        help="Max characters of concatenated context (default: 4000).",
+    )
+    p_eval_gen.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="(Used for dense retrieval encoder.)",
+    )
+    p_eval_gen.set_defaults(func=cmd_eval_generation)
 
     return parser
 
@@ -566,6 +727,145 @@ def cmd_eval_retrieval(args: argparse.Namespace) -> None:
     print(f"Mean HitRate@K : {metrics.mean_hit_rate:.4f}")
     print(f"Mean MRR       : {metrics.mean_mrr:.4f}")
     print()
+
+
+def build_retrieve_fn_for_mode(args: argparse.Namespace):
+    mode = args.mode.lower()
+
+    if mode == "bm25":
+        index_path = Path(args.bm25_index).expanduser().resolve()
+        if not index_path.exists():
+            raise SystemExit(f"BM25 index file does not exist: {index_path}")
+
+        logger.info(f"Loading BM25 index from {index_path} ...")
+        bm25_index = BM25Index.load(index_path)
+        logger.info(
+            f"BM25 index: N={bm25_index.N}, avgdl={bm25_index.avgdl:.2f}"
+        )
+
+        def retrieve_fn(query: str, k: int):
+            return bm25_index.score_query(query, top_k=k)
+
+    elif mode == "dense":
+        index_path = Path(args.dense_index).expanduser().resolve()
+        if not index_path.exists():
+            raise SystemExit(f"Dense index file does not exist: {index_path}")
+
+        logger.info(f"Loading dense index from {index_path} ...")
+        dense_index = DenseIndex.load(index_path)
+        logger.info(
+            f"Dense index: N={dense_index.embeddings.shape[0]}, "
+            f"D={dense_index.embeddings.shape[1]}, "
+            f"model={dense_index.model_name}"
+        )
+
+        encoder = EmbeddingModel(
+            EmbeddingConfig(
+                model_name=dense_index.model_name,
+                device_pref=args.device_pref,
+                batch_size=args.batch_size,
+            )
+        )
+
+        def retrieve_fn(query: str, k: int):
+            return dense_index.search(query=query, encoder=encoder, top_k=k)
+
+    else:
+        raise SystemExit(f"Unknown mode: {mode}. Expected 'bm25' or 'dense'.")
+
+    return retrieve_fn
+
+
+def cmd_rag_answer(args: argparse.Namespace) -> None:
+    """
+    Run a single RAG query (retrieve + generate) and print the answer and context.
+    """
+    retrieve_fn = build_retrieve_fn_for_mode(args)
+
+    gen_cfg = GenerationConfig(
+        model_name=args.model_name,
+        device_pref=args.device_pref,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+    )
+    generator = LocalHFGenerator(gen_cfg)
+
+    pipeline = RAGPipeline(
+        retrieve_fn=retrieve_fn,
+        generator=generator,
+        top_k=args.top_k,
+        max_context_chars=args.max_context_chars,
+    )
+
+    question = args.query
+    rag_answer = pipeline.answer(question)
+
+    print("\nQuestion")
+    print("--------")
+    print(question)
+    print("\nAnswer")
+    print("------")
+    print(rag_answer.answer)
+    print("\nRetrieved contexts")
+    print("------------------")
+    for i, r in enumerate(rag_answer.retrieved, start=1):
+        snippet = r.text[:200].replace("\n", " ")
+        if len(r.text) > 200:
+            snippet += " ..."
+        print(
+            f"{i:2d}. score={r.score:.4f} doc_id={r.doc_id} chunk_id={r.chunk_id}"
+        )
+        print(f"    {snippet}")
+    print()
+
+
+def cmd_eval_generation(args: argparse.Namespace) -> None:
+    """
+    Evaluate end-to-end RAG generation with EM/F1 against reference answers.
+    """
+    qa_path = Path(args.qa_file).expanduser().resolve()
+    if not qa_path.exists():
+        raise SystemExit(f"QA file does not exist: {qa_path}")
+
+    logger.info(f"Loading QA samples from {qa_path} ...")
+    samples = load_qa_jsonl(qa_path)
+    logger.info(f"Loaded {len(samples)} QA samples.")
+
+    retrieve_fn = build_retrieve_fn_for_mode(args)
+
+    gen_cfg = GenerationConfig(
+        model_name=args.model_name,
+        device_pref=args.device_pref,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+    )
+    generator = LocalHFGenerator(gen_cfg)
+
+    pipeline = RAGPipeline(
+        retrieve_fn=retrieve_fn,
+        generator=generator,
+        top_k=args.top_k,
+        max_context_chars=args.max_context_chars,
+    )
+
+    logger.info(
+        f"Evaluating generation: mode={args.mode}, "
+        f"top_k={args.top_k}, num_questions={len(samples)} ..."
+    )
+
+    metrics = eval_gen_fn(samples, pipeline)
+
+    print()
+    print("Generation Evaluation Results")
+    print("----------------------------")
+    print(f"Mode          : {args.mode}")
+    print(f"Num questions : {metrics.num_questions}")
+    print(f"Mean EM       : {metrics.mean_em:.4f}")
+    print(f"Mean F1       : {metrics.mean_f1:.4f}")
+    print()
+
 
 
 def main() -> None:
