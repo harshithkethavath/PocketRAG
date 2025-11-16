@@ -14,7 +14,12 @@ from .data import (
     chunk_corpus,
     load_chunks_from_jsonl,
 )
-from .retrieval import BM25Index
+from .retrieval import (
+    BM25Index,
+    DenseIndex,
+    EmbeddingModel,
+    EmbeddingConfig,
+)
 
 logger = get_logger(__name__)
 
@@ -120,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_bm25_build.set_defaults(func=cmd_build_bm25_index)
 
-    # pocketrag search-bm25
+
     p_bm25_search = subparsers.add_parser(
         "search-bm25",
         help="Run an ad-hoc search query against a BM25 index.",
@@ -144,6 +149,81 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of top results to return (default: 5).",
     )
     p_bm25_search.set_defaults(func=cmd_search_bm25)
+
+
+    p_dense_build = subparsers.add_parser(
+        "build-dense-index",
+        help="Build a dense (embedding) index from a chunks JSONL file.",
+    )
+    p_dense_build.add_argument(
+        "--chunks-file",
+        type=str,
+        required=True,
+        help="Path to JSONL file with DocumentChunks (from build-chunks).",
+    )
+    p_dense_build.add_argument(
+        "--output",
+        type=str,
+        required=True,
+        help="Path to output dense index file (torch save).",
+    )
+    p_dense_build.add_argument(
+        "--model-name",
+        type=str,
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        help="SentenceTransformer model to use (default: all-MiniLM-L6-v2).",
+    )
+    p_dense_build.add_argument(
+        "--device-pref",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device preference for encoding (default: auto).",
+    )
+    p_dense_build.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for encoding (default: 32).",
+    )
+    p_dense_build.set_defaults(func=cmd_build_dense_index)
+
+    p_dense_search = subparsers.add_parser(
+        "search-dense",
+        help="Run an ad-hoc dense retrieval query against a dense index.",
+    )
+    p_dense_search.add_argument(
+        "--index",
+        type=str,
+        required=True,
+        help="Path to dense index file (torch save).",
+    )
+    p_dense_search.add_argument(
+        "--query",
+        type=str,
+        required=True,
+        help="Search query string.",
+    )
+    p_dense_search.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Number of top results to return (default: 5).",
+    )
+    p_dense_search.add_argument(
+        "--device-pref",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device preference when running queries (default: auto).",
+    )
+    p_dense_search.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for query encoding (default: 32).",
+    )
+    p_dense_search.set_defaults(func=cmd_search_dense)
 
     return parser
 
@@ -248,6 +328,108 @@ def cmd_search_bm25(args: argparse.Namespace) -> None:
         return
 
     print(f"Top {len(results)} results:")
+    print("-" * 60)
+    for rank, r in enumerate(results, start=1):
+        snippet = r.text[:200].replace("\n", " ")
+        if len(r.text) > 200:
+            snippet += " ..."
+        print(
+            f"{rank:2d}. score={r.score:.4f}  "
+            f"doc_id={r.doc_id}  chunk_id={r.chunk_id}"
+        )
+        print(f"    {snippet}")
+        print()
+
+
+def cmd_build_dense_index(args: argparse.Namespace) -> None:
+    """
+    Build a dense (embedding) index from a chunks JSONL file.
+    """
+    chunks_file = Path(args.chunks_file).expanduser().resolve()
+    output_path = Path(args.output).expanduser().resolve()
+
+    if not chunks_file.exists():
+        raise SystemExit(f"Chunks file does not exist: {chunks_file}")
+
+    logger.info(f"Loading chunks from {chunks_file} ...")
+    chunks = load_chunks_from_jsonl(chunks_file)
+    if not chunks:
+        logger.warning("No chunks loaded. Nothing to index.")
+        return
+
+    logger.info(
+        f"Loaded {len(chunks)} chunks. Building dense index with "
+        f"model={args.model_name!r}, device_pref={args.device_pref!r}, "
+        f"batch_size={args.batch_size} ..."
+    )
+
+    encoder = EmbeddingModel(
+        EmbeddingConfig(
+            model_name=args.model_name,
+            device_pref=args.device_pref,
+            batch_size=args.batch_size,
+        )
+    )
+
+    index = DenseIndex.from_chunks(
+        chunks=chunks,
+        encoder=encoder,
+        batch_size=args.batch_size,
+    )
+
+    logger.info(
+        f"Dense index built: "
+        f"N={index.embeddings.shape[0]}, "
+        f"D={index.embeddings.shape[1]}, "
+        f"model={index.model_name}"
+    )
+
+    logger.info(f"Saving dense index to {output_path} ...")
+    index.save(output_path)
+    logger.info("Done.")
+
+
+def cmd_search_dense(args: argparse.Namespace) -> None:
+    """
+    Load a dense index and run an ad-hoc query via cosine similarity.
+    """
+    index_path = Path(args.index).expanduser().resolve()
+    if not index_path.exists():
+        raise SystemExit(f"Index file does not exist: {index_path}")
+
+    logger.info(f"Loading dense index from {index_path} ...")
+    index = DenseIndex.load(index_path)
+    logger.info(
+        f"Loaded dense index with "
+        f"N={index.embeddings.shape[0]}, "
+        f"D={index.embeddings.shape[1]}, "
+        f"model={index.model_name}"
+    )
+
+    encoder = EmbeddingModel(
+        EmbeddingConfig(
+            model_name=index.model_name,
+            device_pref=args.device_pref,
+            batch_size=args.batch_size,
+        )
+    )
+
+    query = args.query
+    if not query:
+        raise SystemExit("Query string is empty.")
+
+    logger.info(f"Running dense query: {query!r}")
+    results = index.search(
+        query=query,
+        encoder=encoder,
+        top_k=args.top_k,
+    )
+
+    if not results:
+        print("No results.")
+        return
+
+    print(f"Top {len(results)} dense results:")
     print("-" * 60)
     for rank, r in enumerate(results, start=1):
         snippet = r.text[:200].replace("\n", " ")

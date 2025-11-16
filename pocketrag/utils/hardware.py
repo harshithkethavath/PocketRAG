@@ -109,3 +109,38 @@ def format_hardware_report(report: HardwareReport) -> str:
         f"MPS available   : {report.has_mps}",
     ]
     return "\n".join(lines)
+
+
+def pick_device(device_pref: str = "auto") -> str:
+    """
+    Pick a device string ("cpu", "mps", "cuda") based on preference and availability.
+
+    - "auto": prefer CUDA, then MPS, otherwise CPU.
+    - "cuda": use CUDA if available, else fall back to CPU.
+    - "mps": use MPS if available, else fall back to CPU.
+    - "cpu": always CPU.
+    """
+    if torch is None:
+        return "cpu"
+
+    device_pref = (device_pref or "auto").lower()
+
+    if device_pref == "cpu":
+        return "cpu"
+
+    if device_pref == "cuda":
+        if torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+
+    if device_pref == "mps":
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    # auto
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
